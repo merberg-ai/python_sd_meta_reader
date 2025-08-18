@@ -1,4 +1,4 @@
-<h1>THIS IS MY PERSONAL PROJECT FOR PERSONAL USE. DO NOT USE IN A PRODUCTION ENVIRONMENT!</h1>
+<h1 color=red>THIS IS MY PERSONAL PROJECT FOR PERSONAL USE. DO NOT USE IN A PRODUCTION ENVIRONMENT!</h1>
 # sd_meta_extract
 
 Extract Stable Diffusion–style generation metadata from images and write `.json` sidecars.

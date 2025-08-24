@@ -62,3 +62,7 @@ python sd_meta_extract.py ./renders --max-prompt-len 240
 - PNGs preserve SD metadata; JPEGs usually don’t.
 - Sidecars include `_file`, `_format`, `_size`. If rebuilt, `_sourced_from` contains the PNG path used.
 - Works best with Automatic1111, but will surface ComfyUI/InvokeAI blobs when present.
+
+- ## 📝 License
+
+MIT License. Do whatever you want, just don’t blame me if zombies eat your files. 🧟

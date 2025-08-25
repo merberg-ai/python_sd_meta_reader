@@ -66,4 +66,38 @@ python sd_meta_extract.py ./renders --max-prompt-len 240
 
 - ## 📝 License
 
+## Graphical User Interface (GUI)
+
+- Alongside the command-line tool, this project also includes a graphical user interface for inspecting image metadata. The GUI makes it easy to drag-and-drop, preview, and export extracted information without touching the terminal.
+
+- Features
+
+- Image preview + metadata view: See the source image on the left and the extracted JSON/summary on the right.
+
+- Flexible input:
+
+- Pass an image path on the command line (python sd_meta_extract_gui.py myimage.png)
+
+- Or simply drag and drop a .png/.jpg onto the window
+
+- Or use the Load button / File → Open menu
+
+# Save / Export:
+
+- Save creates a .json sidecar file next to the image
+
+- Export JSON… lets you pick a custom filename and location
+
+- Settings tab:
+
+- Adjust maximum prompt length in summaries
+
+- Enable/disable automatic sidecar saving on load
+
+- Optionally rebuild missing JPEG metadata from sibling PNG files
+
+- Configure which file extensions appear in the Open dialog
+
+
+
 MIT License. Do whatever you want, just don’t blame me if zombies eat your files. 🧟

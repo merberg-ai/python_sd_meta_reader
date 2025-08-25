@@ -56,11 +56,6 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Or, for GUI:
-
-```bash
-pip install -r requirements-gui.txt
-```
 ---
 
 ## Usage

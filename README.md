@@ -132,4 +132,4 @@ For `zombie.png`:
 ---
 
 ## License
-MIT License. Do what you want, but attribution is appreciated.
+MIT License. Do whatever you want, just don’t blame me if zombies eat your files. 🧟

@@ -1,52 +1,228 @@
 #!/usr/bin/env python3
 """
-GUI wrapper for sd_meta_extract.py
+SD Meta Inspector — single-file GUI
+- Extracts Stable Diffusion-style metadata from PNG/JPEG (A1111, ComfyUI, InvokeAI, EXIF/JPEG comment).
+- Side-by-side: image + metadata JSON with a human summary.
+- Persisted settings (~/.sd_meta_inspector.json): default_zoom (50%), rebuild_jpeg_from_png, last_dir.
+- Ctrl+Wheel zoom, +/- buttons, zoom combo.
+- No menu bar; buttons: Load, Export JSON (writes sidecar), Copy Prompt to Clipboard.
 
-Features
-- Open via command-line arg (image path) OR drag & drop OR File > Open
-- Side-by-side: left = image preview, right = metadata (pretty JSON + summary)
-- Load / Save buttons (Save writes sidecar .json next to image or lets you export)
-- Simple Settings tab: max prompt length, auto write sidecar, rebuild from sibling PNG (JPEG),
-  and extension filter used when opening via dialog
-- Non-destructive: only writes sidecar on Save (or if auto-save toggled)
+Tested with Python 3.10+ and PyQt6 + Pillow.
 """
 
 import json
 import sys
+import re
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from PIL import ImageQt, Image
-
+from PIL import Image, PngImagePlugin, ExifTags, ImageQt
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-# ----- Import your extractor (same folder) -----
-try:
-    import sd_meta_extract as core  # your uploaded CLI module
-except Exception as e:
-    core = None
-    _import_error = e
-else:
-    _import_error = None
+# ----------------- Settings -----------------
+def _config_path() -> Path:
+    return Path.home() / ".sd_meta_inspector.json"
 
+DEFAULT_SETTINGS = {
+    "default_zoom": 50,            # percent
+    "rebuild_jpeg_from_png": False,
+    "last_dir": "",
+}
 
-# ----------------- Utilities -----------------
-def pil_image_from_path(p: Path) -> Image.Image | None:
+def load_settings() -> dict:
+    p = _config_path()
+    if p.exists():
+        try:
+            data = json.load(open(p, "r", encoding="utf-8"))
+            merged = DEFAULT_SETTINGS | {k: data.get(k, v) for k, v in DEFAULT_SETTINGS.items()}
+            return merged
+        except Exception:
+            return DEFAULT_SETTINGS.copy()
+    return DEFAULT_SETTINGS.copy()
+
+def save_settings(s: dict) -> None:
     try:
-        return Image.open(p)
+        json.dump(s, open(_config_path(), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+# ----------------- Extraction helpers (embedded from CLI) -----------------
+def load_image(path: Path) -> Image.Image:
+    try:
+        return Image.open(path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to open {path}: {e}")
+
+def get_exif_dict(img: Image.Image) -> Dict[str, Any]:
+    try:
+        exif = img.getexif()
+        if not exif:
+            return {}
+        return {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
+    except Exception:
+        return {}
+
+def get_jpeg_comment(img: Image.Image) -> Optional[bytes]:
+    try:
+        return img.info.get("comment")
     except Exception:
         return None
 
+def safe_json_loads(s: str) -> Optional[Any]:
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
 
-def pixmap_from_pil(img: Image.Image, max_w: int, max_h: int) -> QtGui.QPixmap | None:
+# ---- Automatic1111 parameter block parsing ----
+A1111_KV_RE = re.compile(r"\s*([^:,]+)\s*:\s*([^,]+)\s*(?:,|$)")
+
+def parse_a1111_parameters_block(text: str) -> Dict[str, Any]:
+    """Parse A1111 'parameters' block into structured fields."""
+    out: Dict[str, Any] = {}
+    neg_key = "Negative prompt:"
+    joined = (text or "").strip()
+    if not joined:
+        return out
+
+    def split_tail(blob: str) -> Tuple[str, str]:
+        m = re.search(r"\b(Steps?|Sampler|CFG scale|Seed|Size|Model|Model hash|Version)\b\s*:", blob)
+        if m:
+            return blob[:m.start()].strip(), blob[m.start():].strip()
+        return blob, ""
+
+    if neg_key in joined:
+        p_txt, rest = joined.split(neg_key, 1)
+        out["prompt"], rest = p_txt.strip(), rest
+        neg, tail = split_tail(rest)
+        out["negative_prompt"] = neg.strip(" :")
+        tail_blob = tail
+    else:
+        # No explicit negative; try to split prompt vs KV tail
+        p_txt, tail_blob = split_tail(joined)
+        out["prompt"] = p_txt.strip()
+
+    # parse KVs in tail
+    for m in A1111_KV_RE.finditer(tail_blob):
+        k = m.group(1).strip().lower().replace(" ", "_")
+        v = m.group(2).strip()
+        if k in {"steps", "seed"}:
+            try: out[k] = int(v)
+            except: out[k] = v
+        elif k in {"cfg_scale"}:
+            try: out[k] = float(v)
+            except: out[k] = v
+        elif k == "size":
+            out["size"] = v
+            try:
+                w, h = v.lower().split("x", 1)
+                out["width"], out["height"] = int(w), int(h)
+            except:
+                pass
+        else:
+            out[k] = v
+    return out
+
+# ---- PNG/JPEG extraction ----
+def parse_png_info(info: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    # Automatic1111
+    if "parameters" in info and isinstance(info["parameters"], str):
+        out.update(parse_a1111_parameters_block(info["parameters"]))
+    # ComfyUI
+    if "prompt" in info and isinstance(info["prompt"], str):
+        j = safe_json_loads(info["prompt"])
+        out["comfyui_prompt"] = j if isinstance(j, (dict, list)) else info["prompt"]
+    # InvokeAI
+    if "sd-metadata" in info and isinstance(info["sd-metadata"], str):
+        j = safe_json_loads(info["sd-metadata"])
+        if isinstance(j, dict):
+            out["invokeai_metadata"] = j
+    # Other labels
+    for k in ("Software", "Version"):
+        if k in info:
+            out[k.lower()] = info[k]
+    return out
+
+def try_extract_png(img: Image.Image) -> Dict[str, Any]:
+    if not isinstance(img, PngImagePlugin.PngImageFile):
+        return {}
+    return parse_png_info(dict(img.info))
+
+def try_extract_jpeg(img: Image.Image) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    exif = get_exif_dict(img)
+    for k in ("UserComment", "ImageDescription", "XPComment"):
+        v = exif.get(k)
+        if isinstance(v, bytes):
+            try:
+                v = v.decode("utf-16-le") if k.startswith("XP") else v.decode("utf-8", "ignore")
+            except:
+                v = None
+        if isinstance(v, str) and v.strip():
+            out.update(parse_a1111_parameters_block(v) or {"raw_exif_comment": v})
+    c = get_jpeg_comment(img)
+    if c:
+        s = c.decode("utf-8", "ignore")
+        out.update(parse_a1111_parameters_block(s) or {"raw_jpeg_comment": s})
+    return out
+
+def extract_from_image(path: Path) -> Dict[str, Any]:
+    img = load_image(path)
+    meta: Dict[str, Any] = {}
+    if img.format == "PNG":
+        meta.update(try_extract_png(img))
+    elif img.format in {"JPEG", "JPG"}:
+        meta.update(try_extract_jpeg(img))
+    else:
+        meta.update(try_extract_png(img))
+        meta.update(try_extract_jpeg(img))
+    if not meta:
+        meta["_note"] = "No SD-style metadata found."
+    meta["_file"] = str(path)
+    meta["_format"] = img.format
+    meta["_size"] = {"width": img.width, "height": img.height}
+    return meta
+
+def sibling_png(path: Path) -> Optional[Path]:
+    # try exact stem, plus removing common counters like _00000
+    candidates = [
+        path.with_suffix(".png"),
+        path.with_name(path.stem.split(".")[0] + ".png"),
+    ]
+    for suffix in ("-00000", "-0000", "-000", "_00000", "_0000", "_000"):
+        if path.stem.endswith(suffix):
+            candidates.append(path.with_name(path.stem[: -len(suffix)] + ".png"))
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+def rebuild_from_sibling_png(jpeg_path: Path) -> Optional[Dict[str, Any]]:
+    sib = sibling_png(jpeg_path)
+    if not sib:
+        return None
+    try:
+        meta_png = extract_from_image(sib)
+    except Exception:
+        return None
+    meta = dict(meta_png)
+    meta["_sourced_from"] = str(sib)
+    meta["_file"] = str(jpeg_path)
+    try:
+        img = Image.open(jpeg_path)
+        meta["_format"] = img.format
+        meta["_size"] = {"width": img.width, "height": img.height}
+    except Exception:
+        pass
+    return meta
+
+# ----------------- GUI utilities -----------------
+def qt_pixmap_from_pil(img: Image.Image) -> QtGui.QPixmap | None:
     if img is None:
         return None
-    w, h = img.size
-    scale = min(max_w / max(1, w), max_h / max(1, h), 1.0)
-    if scale < 1.0:
-        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     qim = ImageQt.ImageQt(img.convert("RGBA"))
     return QtGui.QPixmap.fromImage(qim)
-
 
 def pretty_json(obj) -> str:
     try:
@@ -54,9 +230,7 @@ def pretty_json(obj) -> str:
     except Exception:
         return str(obj)
 
-
-def summary_line(meta: dict, max_prompt_len: int = 160) -> str:
-    # Roughly mirror your CLI summary
+def summary_line(meta: Dict[str, Any], max_prompt_len: int = 160) -> str:
     file = Path(meta.get("_file", "")).name
     fmt = meta.get("_format", "?")
     size = meta.get("_size", {})
@@ -66,9 +240,11 @@ def summary_line(meta: dict, max_prompt_len: int = 160) -> str:
     cfg = meta.get("cfg_scale")
     model = meta.get("model") or meta.get("software") or meta.get("version")
     prompt = meta.get("prompt") or meta.get("comfyui_prompt")
+
     def shorten(text: str, limit: int = 160) -> str:
         t = " ".join((text or "").split())
         return t if len(t) <= limit else t[: max(0, limit - 1)] + "…"
+
     bits = [f"{file} [{fmt},{w}x{h}]"]
     if seed is not None: bits.append(f"seed {seed}")
     if steps is not None: bits.append(f"steps {steps}")
@@ -80,13 +256,13 @@ def summary_line(meta: dict, max_prompt_len: int = 160) -> str:
         body = shorten(json.dumps(prompt), max_prompt_len)
     elif isinstance(prompt, str):
         body = shorten(prompt, max_prompt_len)
-    else:
-        body = "No prompt found" if meta.get("_note") else ""
+    elif meta.get("_note"):
+        body = "No prompt found"
     return head + ("\n" + body if body else "")
 
-
 # ----------------- Widgets -----------------
-class DropImageLabel(QtWidgets.QLabel):
+class ZoomableImageLabel(QtWidgets.QLabel):
+    wheelZoomRequested = QtCore.pyqtSignal(int)
     fileDropped = QtCore.pyqtSignal(str)
 
     def __init__(self, *a, **k):
@@ -99,8 +275,7 @@ class DropImageLabel(QtWidgets.QLabel):
         if e.mimeData().hasUrls():
             for u in e.mimeData().urls():
                 if u.isLocalFile():
-                    suf = Path(u.toLocalFile()).suffix.lower()
-                    if suf in {".png", ".jpg", ".jpeg"}:
+                    if Path(u.toLocalFile()).suffix.lower() in {".png", ".jpg", ".jpeg"}:
                         e.acceptProposedAction()
                         return
         e.ignore()
@@ -113,82 +288,37 @@ class DropImageLabel(QtWidgets.QLabel):
                     self.fileDropped.emit(p)
                     break
 
-
-class SettingsPane(QtWidgets.QWidget):
-    settingsChanged = QtCore.pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-
-        self.maxPrompt = QtWidgets.QSpinBox()
-        self.maxPrompt.setRange(32, 10000)
-        self.maxPrompt.setValue(160)
-
-        self.autoSidecar = QtWidgets.QCheckBox("Auto-save sidecar on load")
-        self.autoSidecar.setChecked(False)
-
-        self.rebuildJPEG = QtWidgets.QCheckBox("Try rebuild JPEG sidecar from sibling PNG")
-        self.rebuildJPEG.setToolTip("If a JPEG has no metadata, copy metadata from a sibling PNG with same stem.")
-
-        self.extEdit = QtWidgets.QLineEdit(".png,.jpg,.jpeg")
-        self.extEdit.setToolTip("Extensions used by the Open dialog (comma-separated).")
-
-        form = QtWidgets.QFormLayout()
-        form.addRow("Max prompt length:", self.maxPrompt)
-        form.addRow(self.autoSidecar)
-        form.addRow(self.rebuildJPEG)
-        form.addRow("File extensions filter:", self.extEdit)
-
-        wrap = QtWidgets.QVBoxLayout(self)
-        wrap.addLayout(form)
-        wrap.addStretch(1)
-
-        for w in (self.maxPrompt, self.autoSidecar, self.rebuildJPEG, self.extEdit):
-            if isinstance(w, QtWidgets.QAbstractButton):
-                w.toggled.connect(self.settingsChanged.emit)
-            elif isinstance(w, QtWidgets.QSpinBox):
-                w.valueChanged.connect(self.settingsChanged.emit)
-            elif isinstance(w, QtWidgets.QLineEdit):
-                w.textChanged.connect(self.settingsChanged.emit)
-
-    # Helpers to read settings
-    def get_max_prompt_len(self) -> int:
-        return int(self.maxPrompt.value())
-
-    def get_auto_sidecar(self) -> bool:
-        return self.autoSidecar.isChecked()
-
-    def get_rebuild_jpeg(self) -> bool:
-        return self.rebuildJPEG.isChecked()
-
-    def get_extensions(self) -> set[str]:
-        raw = self.extEdit.text().strip()
-        if not raw:
-            return {".png", ".jpg", ".jpeg"}
-        parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
-        out = set()
-        for p in parts:
-            if not p.startswith("."):
-                p = "." + p
-            out.add(p)
-        return out
-
+    def wheelEvent(self, e: QtGui.QWheelEvent):
+        if QtWidgets.QApplication.keyboardModifiers() & QtCore.Qt.KeyboardModifier.ControlModifier:
+            steps = int(e.angleDelta().y() / 120)
+            if steps:
+                self.wheelZoomRequested.emit(steps)
+                e.accept()
+                return
+        super().wheelEvent(e)
 
 class InspectorPane(QtWidgets.QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    statusMessage = QtCore.pyqtSignal(str)
+    imageScaledSize = QtCore.pyqtSignal(int, int)
 
-        # Left: image; Right: metadata
-        self.imageLabel = DropImageLabel("Drop an image here\n(.png, .jpg)")
+    def __init__(self, app_settings: dict, parent=None):
+        super().__init__(parent)
+        self.app_settings = app_settings
+
+        # Left: image
+        self.imageLabel = ZoomableImageLabel("Drop an image here\n(.png, .jpg)")
         self.imageLabel.setMinimumSize(320, 240)
         self.imageLabel.fileDropped.connect(self._on_drop)
+        self.imageLabel.wheelZoomRequested.connect(self._on_wheel_zoom)
 
-        self.metaSummary = QtWidgets.QTextEdit()
-        self.metaSummary.setReadOnly(True)
+        self.imageScroll = QtWidgets.QScrollArea()
+        self.imageScroll.setWidgetResizable(True)
+        self.imageScroll.setWidget(self.imageLabel)
+
+        # Right: meta
+        self.metaSummary = QtWidgets.QTextEdit(readOnly=True)
         self.metaSummary.setMinimumHeight(80)
-
-        self.metaJSON = QtWidgets.QPlainTextEdit()
-        self.metaJSON.setReadOnly(True)
+        self.metaJSON = QtWidgets.QPlainTextEdit(readOnly=True)
 
         rightBox = QtWidgets.QVBoxLayout()
         rightBox.addWidget(QtWidgets.QLabel("Summary"))
@@ -196,173 +326,261 @@ class InspectorPane(QtWidgets.QWidget):
         rightBox.addWidget(QtWidgets.QLabel("Extracted JSON"))
         rightBox.addWidget(self.metaJSON, 1)
 
-        splitter = QtWidgets.QSplitter()
-        splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         leftWrap = QtWidgets.QWidget()
         leftLay = QtWidgets.QVBoxLayout(leftWrap)
-        leftLay.addWidget(self.imageLabel, 1)
-        splitter.addWidget(leftWrap)
+
+        # Zoom controls
+        zoomRow = QtWidgets.QHBoxLayout()
+        zoomRow.addWidget(QtWidgets.QLabel("Zoom"))
+        self.zoomCombo = QtWidgets.QComboBox()
+        for z in (25, 50, 75, 100, 125, 150, 200, 300, 400):
+            self.zoomCombo.addItem(f"{z} %", z)
+        self.zoomCombo.currentIndexChanged.connect(self._on_zoom_combo_changed)
+        self.btnZoomOut = QtWidgets.QToolButton(text="–")
+        self.btnZoomIn = QtWidgets.QToolButton(text="+")
+        self.btnZoomOut.clicked.connect(lambda: self.set_zoom(self.zoomPercent - 25))
+        self.btnZoomIn.clicked.connect(lambda: self.set_zoom(self.zoomPercent + 25))
+        zoomRow.addWidget(self.zoomCombo)
+        zoomRow.addWidget(self.btnZoomOut)
+        zoomRow.addWidget(self.btnZoomIn)
+        zoomRow.addStretch(1)
+
+        leftLay.addLayout(zoomRow)
+        leftLay.addWidget(self.imageScroll, 1)
 
         rightWrap = QtWidgets.QWidget()
         rightWrap.setLayout(rightBox)
-        splitter.addWidget(rightWrap)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
 
-        # Buttons
+        self.splitter.addWidget(leftWrap)
+        self.splitter.addWidget(rightWrap)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 2)
+
+        # Top bar: Load / Export / Copy + extraction option
         self.btnLoad = QtWidgets.QPushButton("Load")
-        self.btnSave = QtWidgets.QPushButton("Save")
-        self.btnExport = QtWidgets.QPushButton("Export JSON…")
+        self.btnExport = QtWidgets.QPushButton("Export JSON")
+        self.btnCopyPrompt = QtWidgets.QPushButton("Copy Prompt to Clipboard")
+        self.chkRebuildJPEG = QtWidgets.QCheckBox("Rebuild JPEG from sibling PNG")
+        self.chkRebuildJPEG.setChecked(bool(self.app_settings.get("rebuild_jpeg_from_png", False)))
+        self.chkRebuildJPEG.toggled.connect(self._on_rebuild_toggled)
+
         btnRow = QtWidgets.QHBoxLayout()
         btnRow.addWidget(self.btnLoad)
-        btnRow.addWidget(self.btnSave)
         btnRow.addWidget(self.btnExport)
+        btnRow.addWidget(self.btnCopyPrompt)
+        btnRow.addSpacing(16)
+        btnRow.addWidget(self.chkRebuildJPEG)
         btnRow.addStretch(1)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(btnRow)
-        layout.addWidget(splitter, 1)
+        layout.addWidget(self.splitter, 1)
 
+        # State
         self.currentPath: Path | None = None
-        self.currentMeta: dict | None = None
+        self.currentMeta: Dict[str, Any] | None = None
+        self._sourceImage: Image.Image | None = None
+        self.zoomPercent: int = int(self.app_settings.get("default_zoom", 50))
 
+        # Wire up
         self.btnLoad.clicked.connect(self.open_dialog)
-        self.btnSave.clicked.connect(self.save_sidecar)
         self.btnExport.clicked.connect(self.export_json)
+        self.btnCopyPrompt.clicked.connect(self.copy_prompt_to_clipboard)
 
-        # Keep a pointer to settings provider
-        self.settings_provider: SettingsPane | None = None
+        # Init zoom UI
+        self._apply_zoom_combo_from_settings()
 
-    # Wiring from MainWindow to read settings
-    def set_settings_provider(self, sp: SettingsPane):
-        self.settings_provider = sp
+    # ---- settings hooks ----
+    def _on_rebuild_toggled(self, checked: bool):
+        self.app_settings["rebuild_jpeg_from_png"] = bool(checked)
+        save_settings(self.app_settings)
 
-    # ---- Actions ----
+    def _apply_zoom_combo_from_settings(self):
+        val = int(self.app_settings.get("default_zoom", 50))
+        idx = self.zoomCombo.findData(val)
+        if idx < 0:
+            idx = self.zoomCombo.findData(50)
+            val = 50
+        self.zoomCombo.blockSignals(True)
+        self.zoomCombo.setCurrentIndex(idx)
+        self.zoomCombo.blockSignals(False)
+        self.set_zoom(val, update_combo=False)
+
+    def _persist_zoom(self, percent: int):
+        if self.app_settings.get("default_zoom") != percent:
+            self.app_settings["default_zoom"] = percent
+            save_settings(self.app_settings)
+
+    # ---- file actions ----
     def _on_drop(self, path: str):
         self.load_image(Path(path))
 
     def open_dialog(self):
-        exts = {".png", ".jpg", ".jpeg"}
-        if self.settings_provider:
-            exts = self.settings_provider.get_extensions()
-        patt = "Images (" + " ".join(f"*{e}" for e in sorted(exts)) + ")"
-        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open Image", "", patt)
+        start_dir = self.app_settings.get("last_dir") or ""
+        if start_dir and not Path(start_dir).exists():
+            start_dir = ""
+        patt = "Images (*.png *.jpg *.jpeg)"
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open Image", start_dir, patt)
         if f:
-            self.load_image(Path(f))
+            p = Path(f)
+            self.app_settings["last_dir"] = str(p.parent)
+            save_settings(self.app_settings)
+            self.load_image(p)
 
     def load_image(self, p: Path):
-        if core is None:
-            QtWidgets.QMessageBox.critical(
-                self, "Import error",
-                f"Could not import sd_meta_extract.py:\n{_import_error}"
-            )
-            return
-        img = pil_image_from_path(p)
-        if img is None:
-            QtWidgets.QMessageBox.warning(self, "Open failed", f"Could not open image:\n{p}")
-            return
-        pm = pixmap_from_pil(img, 2000, 2000)  # scale down if huge
-        self.imageLabel.setPixmap(pm)
-        self.imageLabel.setStyleSheet("")  # remove dashed border after load
+        img = load_image(p)
+        self._sourceImage = img
         self.currentPath = p
 
-        # Extract
-        meta = core.extract_from_image(p)
-        # Optional JPEG salvage
-        if (self.settings_provider and self.settings_provider.get_rebuild_jpeg()
-            and p.suffix.lower() in {".jpg", ".jpeg"} and ("_note" in meta)):
-            salvaged = core.rebuild_from_sibling_png(p)
+        meta = extract_from_image(p)
+        if (self.chkRebuildJPEG.isChecked()
+                and p.suffix.lower() in {".jpg", ".jpeg"} and ("_note" in meta)):
+            salvaged = rebuild_from_sibling_png(p)
             if salvaged:
                 meta = salvaged
 
         self.currentMeta = meta
-        self.metaSummary.setPlainText(
-            summary_line(meta, self.settings_provider.get_max_prompt_len() if self.settings_provider else 160)
-        )
+        self.metaSummary.setPlainText(summary_line(meta, 160))
         self.metaJSON.setPlainText(pretty_json(meta))
-        self.parent().parent().statusBar().showMessage(f"Loaded {p}")
+        self.imageLabel.setStyleSheet("")
 
-        # Auto sidecar?
-        if self.settings_provider and self.settings_provider.get_auto_sidecar():
-            self.save_sidecar(auto=True)
+        # Apply zoom
+        self.set_zoom(self.zoomPercent, update_combo=True)
+        self.statusMessage.emit(f"Loaded {p}")
 
-    def save_sidecar(self, auto: bool = False):
+        # Resize window to scaled image
+        pm = self.imageLabel.pixmap()
+        if pm:
+            self.imageScaledSize.emit(pm.width(), pm.height())
+
+    # ---- zoom mechanics ----
+    def _on_zoom_combo_changed(self, _index: int):
+        val = self.zoomCombo.currentData()
+        if isinstance(val, int):
+            self.set_zoom(val, update_combo=False)
+            self._persist_zoom(self.zoomPercent)
+
+    def _on_wheel_zoom(self, steps: int):
+        new_zoom = self.zoomPercent + (25 * steps)
+        self.set_zoom(new_zoom)
+        self._persist_zoom(self.zoomPercent)
+
+    def set_zoom(self, percent: int, update_combo: bool = True):
+        percent = max(25, min(400, int(percent)))
+        self.zoomPercent = percent
+        if update_combo:
+            idx = self.zoomCombo.findData(percent)
+            if idx >= 0:
+                self.zoomCombo.blockSignals(True)
+                self.zoomCombo.setCurrentIndex(idx)
+                self.zoomCombo.blockSignals(False)
+
+        if self._sourceImage is None:
+            return
+
+        w, h = self._sourceImage.size
+        scale = percent / 100.0
+        target_w = max(1, int(w * scale))
+        target_h = max(1, int(h * scale))
+        scaled = self._sourceImage.resize((target_w, target_h), Image.LANCZOS)
+        pm = qt_pixmap_from_pil(scaled)
+        self.imageLabel.setPixmap(pm)
+        self.imageLabel.adjustSize()
+
+        self.statusMessage.emit(f"Zoom {percent}%")
+        self.imageScaledSize.emit(target_w, target_h)
+
+    # ---- export / clipboard ----
+    def export_json(self):
         if not self.currentPath or not self.currentMeta:
-            if not auto:
-                QtWidgets.QMessageBox.information(self, "Nothing to save", "Load an image first.")
+            QtWidgets.QMessageBox.information(self, "Nothing to export", "Load an image first.")
             return
         sidecar = self.currentPath.with_suffix(self.currentPath.suffix + ".json")
         try:
             with open(sidecar, "w", encoding="utf-8") as fp:
                 json.dump(self.currentMeta, fp, indent=2, ensure_ascii=False)
         except Exception as e:
-            if not auto:
-                QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
+            QtWidgets.QMessageBox.critical(self, "Export failed", f"Sidecar write error:\n{e}")
             return
-        self.parent().parent().statusBar().showMessage(f"Saved sidecar: {sidecar}")
+        self.statusMessage.emit(f"Saved sidecar: {sidecar}")
 
-    def export_json(self):
+    def copy_prompt_to_clipboard(self):
         if not self.currentMeta:
-            QtWidgets.QMessageBox.information(self, "Nothing to export", "Load an image first.")
+            QtWidgets.QMessageBox.information(self, "Nothing to copy", "Load an image first.")
             return
-        f, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export JSON", "metadata.json", "JSON (*.json)")
-        if not f:
+        meta = self.currentMeta
+        # Priority: plain 'prompt' text
+        text = meta.get("prompt")
+        if isinstance(text, str) and text.strip():
+            QtWidgets.QApplication.clipboard().setText(text.strip())
+            self.statusMessage.emit("Copied prompt to clipboard")
             return
-        try:
-            with open(f, "w", encoding="utf-8") as fp:
-                json.dump(self.currentMeta, fp, indent=2, ensure_ascii=False)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Export failed", str(e))
+        # Fallback: ComfyUI structured prompt -> JSON string
+        comfy = meta.get("comfyui_prompt")
+        if comfy is not None:
+            QtWidgets.QApplication.clipboard().setText(
+                json.dumps(comfy, indent=2, ensure_ascii=False) if not isinstance(comfy, str) else comfy
+            )
+            self.statusMessage.emit("Copied ComfyUI prompt JSON to clipboard")
             return
-        self.parent().parent().statusBar().showMessage(f"Exported: {f}")
-
+        QtWidgets.QMessageBox.information(self, "No prompt found", "This image doesn't contain a prompt field.")
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, start_path: Path | None = None):
+    def __init__(self, app_settings: dict, start_path: Path | None = None):
         super().__init__()
         self.setWindowTitle("SD Meta Inspector")
         self.resize(1200, 800)
 
-        tabs = QtWidgets.QTabWidget()
-        self.inspector = InspectorPane()
-        self.settings = SettingsPane()
-        self.inspector.set_settings_provider(self.settings)
+        # No menu bar (keep it empty)
+        self.setMenuBar(QtWidgets.QMenuBar())
 
-        tabs.addTab(self.inspector, "Inspector")
-        tabs.addTab(self.settings, "Settings")
-
-        self.setCentralWidget(tabs)
-
-        # Menu
-        fileMenu = self.menuBar().addMenu("&File")
-        actOpen = fileMenu.addAction("Open…")
-        actSave = fileMenu.addAction("Save sidecar")
-        fileMenu.addSeparator()
-        actQuit = fileMenu.addAction("Quit")
-        actOpen.triggered.connect(self.inspector.open_dialog)
-        actSave.triggered.connect(self.inspector.save_sidecar)
-        actQuit.triggered.connect(lambda: QtWidgets.QApplication.instance().quit())
+        self.inspector = InspectorPane(app_settings)
+        self.setCentralWidget(self.inspector)
 
         self.setStatusBar(QtWidgets.QStatusBar())
+        self.inspector.statusMessage.connect(self.statusBar().showMessage)
+        self.inspector.imageScaledSize.connect(self._maybe_resize_window)
 
-        # If given a starting file, load it
         if start_path and start_path.exists():
             QtCore.QTimer.singleShot(0, lambda: self.inspector.load_image(start_path))
 
+    def _maybe_resize_window(self, img_w: int, img_h: int):
+        right_min = 360
+        splitter = self.centralWidget().splitter
+        right_widget = splitter.widget(1)
+        right_w = max(right_min, right_widget.width() or right_widget.sizeHint().width() or right_min)
+
+        extra_w = 60
+        extra_h = 140
+        scr = QtGui.QGuiApplication.primaryScreen().availableGeometry()
+        max_w = scr.width() - 40
+        max_h = scr.height() - 80
+
+        target_w = min(img_w + right_w + extra_w, max_w)
+        target_h = min(max(img_h, 500) + extra_h, max_h)
+        self.resize(target_w, target_h)
+
+        left_target = min(img_w + 20, target_w - right_w - 40)
+        if left_target < 200:
+            left_target = max(200, target_w // 3)
+        splitter.setSizes([left_target, target_w - left_target - 10])
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    # Optional CLI arg
+
+    settings = load_settings()
     start_path = None
     if len(sys.argv) > 1:
         p = Path(sys.argv[1])
         if p.exists():
             start_path = p
+            settings["last_dir"] = str(p.parent)
+            save_settings(settings)
 
-    mw = MainWindow(start_path)
+    mw = MainWindow(settings, start_path)
     mw.show()
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()

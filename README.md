@@ -61,9 +61,6 @@ Or, for GUI:
 ```bash
 pip install -r requirements-gui.txt
 ```
-
-(`requirements.txt` = CLI only; `requirements-gui.txt` = CLI + GUI)
-
 ---
 
 ## Usage

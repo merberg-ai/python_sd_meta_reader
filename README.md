@@ -131,12 +131,5 @@ For `zombie.png`:
 
 ---
 
-## Roadmap / Ideas
-- Keyboard shortcuts in GUI (Ctrl+O for open, Ctrl+E for export, Ctrl+C for copy prompt, Ctrl+0/+/– for zoom presets).
-- Batch extraction tab in GUI for whole folders.
-- Filter/search inside JSON view.
-
----
-
 ## License
 MIT License. Do what you want, but attribution is appreciated.
